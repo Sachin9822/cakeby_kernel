@@ -409,7 +409,6 @@ int is_ext_spk_gpio_support(struct platform_device *pdev,
 			return -EINVAL;
 		}
 #ifdef CONFIG_MACH_XIAOMI_TISSOT
-		ext_pa_gpio = pdata->spk_ext_pa_gpio;
 #endif
 	}
 #ifdef CONFIG_MACH_XIAOMI_MIDO
@@ -436,7 +435,6 @@ static int enable_spk_ext_pa(struct snd_soc_codec *codec, int enable)
 	}
 
 #ifdef CONFIG_MACH_XIAOMI_TISSOT
-	ext_pa_status = enable;
 #endif
 
 	pr_debug("%s: %s external speaker PA\n", __func__,
