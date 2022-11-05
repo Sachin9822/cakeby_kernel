@@ -28,6 +28,7 @@
 #include <dsp/q6core.h>
 #include <ipc/apr.h>
 #include <soc/internal.h>
+#include <dsp/audio_notifier.h>
 #include "sdm660-cdc-registers.h"
 #include "msm-digital-cdc.h"
 #include "msm-cdc-common.h"
@@ -44,7 +45,11 @@
 #define MSM_DIG_CDC_VERSION_ENTRY_SIZE 32
 #define MAX_ON_DEMAND_DIG_SUPPLY_NAME_LENGTH 64
 #define CODEC_DT_MAX_PROP_SIZE 40
-#define CONFIG_SOUND_CONTROL
+/*
+ * 200 Milliseconds sufficient for DSP bring up in the lpass
+ * after Sub System Restart
+ */
+#define ADSP_STATE_READY_TIMEOUT_MS 200
 
 static unsigned long rx_digital_gain_reg[] = {
 	MSM89XX_CDC_CORE_RX1_VOL_CTL_B2_CTL,
@@ -1226,6 +1231,97 @@ static struct snd_info_entry_ops msm_dig_codec_info_ops = {
 	.read = msm_dig_codec_version_read,
 };
 
+static int digt_cdc_notifer_service_cb(struct notifier_block *nb,
+				unsigned long opcode, void *ptr)
+{
+	struct msm_dig_priv *dig_cdc_priv = container_of(nb,
+						struct msm_dig_priv,
+						service_nb);
+	struct snd_soc_codec *codec = dig_cdc_priv->codec;
+	bool adsp_ready = false;
+	unsigned long timeout;
+	int ret;
+	static bool initial_boot = true;
+	struct msm_asoc_mach_data *pdata = NULL;
+	struct audio_notifier_cb_data *cb_data = ptr;
+	struct msm_dig_priv *msm_dig_cdc = snd_soc_codec_get_drvdata(codec);
+
+	pdata = snd_soc_card_get_drvdata(codec->component.card);
+	pr_debug("%s: opcode 0x%lx, service=%d\n", __func__, opcode,
+			cb_data->service);
+
+	switch (opcode) {
+	case AUDIO_NOTIFIER_SERVICE_DOWN:
+		if (initial_boot &&
+			cb_data->service == AUDIO_NOTIFIER_PDR_SERVICE) {
+			initial_boot = false;
+			break;
+		}
+		dev_dbg(codec->dev,
+			"ADSP is about to power down. teardown/reset codec\n");
+
+		regcache_cache_only(msm_dig_cdc->regmap, true);
+		mutex_lock(&pdata->cdc_int_mclk0_mutex);
+		atomic_set(&pdata->int_mclk0_enabled, false);
+		mutex_unlock(&pdata->cdc_int_mclk0_mutex);
+		snd_soc_card_change_online_state(codec->component.card, 0);
+		break;
+
+	case AUDIO_NOTIFIER_SERVICE_UP:
+		if (initial_boot &&
+			cb_data->service == AUDIO_NOTIFIER_PDR_SERVICE)
+			initial_boot = false;
+		dev_dbg(codec->dev,
+			"ADSP is about to power up. bring up codec\n");
+
+		adsp_ready = q6core_is_adsp_ready();
+		if (!adsp_ready) {
+			timeout = jiffies +
+				  msecs_to_jiffies(ADSP_STATE_READY_TIMEOUT_MS);
+			do {
+				if (!q6core_is_adsp_ready())
+					continue;
+				adsp_ready = true;
+			} while (!adsp_ready && time_after(timeout, jiffies));
+		}
+
+		if (!adsp_ready) {
+			dev_err(codec->dev, "%s: DSP isn't ready\n", __func__);
+			break;
+		}
+
+		dev_dbg(codec->dev, "%s: DSP is ready\n", __func__);
+
+		regcache_cache_only(msm_dig_cdc->regmap, false);
+		regcache_mark_dirty(msm_dig_cdc->regmap);
+
+		mutex_lock(&pdata->cdc_int_mclk0_mutex);
+		pdata->digital_cdc_core_clk.enable = 1;
+		ret = afe_set_lpass_clock_v2(
+					AFE_PORT_ID_PRIMARY_MI2S_RX,
+					&pdata->digital_cdc_core_clk);
+		if (ret < 0) {
+			pr_err("%s: failed to enable the MCLK\n",
+			       __func__);
+			mutex_unlock(&pdata->cdc_int_mclk0_mutex);
+			break;
+		}
+		mutex_unlock(&pdata->cdc_int_mclk0_mutex);
+		regcache_sync(msm_dig_cdc->regmap);
+		mutex_lock(&pdata->cdc_int_mclk0_mutex);
+		pdata->digital_cdc_core_clk.enable = 0;
+		afe_set_lpass_clock_v2(AFE_PORT_ID_PRIMARY_MI2S_RX,
+			&pdata->digital_cdc_core_clk);
+		mutex_unlock(&pdata->cdc_int_mclk0_mutex);
+		snd_soc_card_change_online_state(codec->component.card, 1);
+		break;
+
+	default:
+		break;
+	}
+	return NOTIFY_OK;
+}
+
 /*
  * msm_dig_codec_info_create_codec_entry - creates msm_dig module
  * @codec_root: The parent directory
@@ -1336,114 +1432,6 @@ static void sdm660_tx_mute_update_callback(struct work_struct *work)
 		decimator = 0;
 	}
 }
-
-#ifdef CONFIG_SOUND_CONTROL
-static struct snd_soc_codec *sound_control_codec_ptr;
-static int speaker_gain_val = 6;
-int sound_control_speaker_gain(int gain);
-
-static ssize_t headphone_gain_show(struct kobject *kobj,
-		struct kobj_attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d %d\n",
-		snd_soc_read(sound_control_codec_ptr, MSM89XX_CDC_CORE_RX1_VOL_CTL_B2_CTL),
-		snd_soc_read(sound_control_codec_ptr, MSM89XX_CDC_CORE_RX2_VOL_CTL_B2_CTL)
-	);
-}
-
-static ssize_t headphone_gain_store(struct kobject *kobj,
-		struct kobj_attribute *attr, const char *buf, size_t count)
-{
-
-	int input_l, input_r;
-
-	sscanf(buf, "%d %d", &input_l, &input_r);
-
-	if (input_l < -84 || input_l > 20)
-		input_l = 0;
-
-	if (input_r < -84 || input_r > 20)
-		input_r = 0;
-
-	snd_soc_write(sound_control_codec_ptr, MSM89XX_CDC_CORE_RX1_VOL_CTL_B2_CTL, input_l);
-	snd_soc_write(sound_control_codec_ptr, MSM89XX_CDC_CORE_RX2_VOL_CTL_B2_CTL, input_r);
-
-	return count;
-}
-
-static struct kobj_attribute headphone_gain_attribute =
-	__ATTR(headphone_gain, 0664,
-		headphone_gain_show,
-		headphone_gain_store);
-
-static ssize_t mic_gain_show(struct kobject *kobj,
-		struct kobj_attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n",
-		snd_soc_read(sound_control_codec_ptr, MSM89XX_CDC_CORE_TX1_VOL_CTL_GAIN));
-}
-
-static ssize_t mic_gain_store(struct kobject *kobj,
-		struct kobj_attribute *attr, const char *buf, size_t count)
-{
-	int input;
-
-	sscanf(buf, "%d", &input);
-
-	if (input < -10 || input > 20)
-		input = 0;
-
-	snd_soc_write(sound_control_codec_ptr, MSM89XX_CDC_CORE_TX1_VOL_CTL_GAIN, input);
-
-	return count;
-}
-
-static struct kobj_attribute mic_gain_attribute =
-	__ATTR(mic_gain, 0664,
-		mic_gain_show,
-		mic_gain_store);
-
-//0:mute  1:+3db  2:+6db  3:+9db  4:+12db  5:+15db  6:+18db
-static ssize_t speaker_gain_show(struct kobject *kobj,
-		struct kobj_attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n",	speaker_gain_val);
-}
-
-static ssize_t speaker_gain_store(struct kobject *kobj,
-		struct kobj_attribute *attr, const char *buf, size_t count)
-{
-	int input;
-
-	sscanf(buf, "%d", &input);
-
-	if (input >= 0 && input <= 6)
-		speaker_gain_val = sound_control_speaker_gain(input);
-	else
-		speaker_gain_val = sound_control_speaker_gain(6);
-
-	return count;
-}
-
-static struct kobj_attribute speaker_gain_attribute =
-	__ATTR(speaker_gain, 0664,
-		speaker_gain_show,
-		speaker_gain_store);
-
-static struct attribute *sound_control_attrs[] = {
-		&headphone_gain_attribute.attr,
-		&mic_gain_attribute.attr,
-		&speaker_gain_attribute.attr,
-		NULL,
-};
-
-static struct attribute_group sound_control_attr_group = {
-		.attrs = sound_control_attrs,
-};
-
-static struct kobject *sound_control_kobj;
-#endif
-
 static int msm_dig_cdc_soc_probe(struct snd_soc_codec *codec)
 {
 	struct msm_dig_priv *msm_dig_cdc = dev_get_drvdata(codec->dev);
@@ -1484,6 +1472,23 @@ static int msm_dig_cdc_soc_probe(struct snd_soc_codec *codec)
 			return ret;
 		}
 	}
+
+	/* no_analog_codec, i.e, only digital codec is enabled, need to
+	 * register notifier to monitor the adsp status
+	 */
+	if (msm_dig_cdc->no_analog_codec) {
+		msm_dig_cdc->service_nb.notifier_call =
+				digt_cdc_notifer_service_cb;
+		ret = audio_notifier_register("msm_digit_cdc",
+					      AUDIO_NOTIFIER_ADSP_DOMAIN,
+					      &msm_dig_cdc->service_nb);
+		if (ret < 0) {
+			pr_err("%s: Audio notifier register failed ret = %d\n",
+				__func__, ret);
+			return ret;
+		}
+	}
+
 	msm_dig_cdc_update_micbias_regulator(
 			msm_dig_cdc,
 			on_demand_supply_name[ON_DEMAND_DIGITAL],
@@ -2450,7 +2455,6 @@ static int msm_dig_cdc_probe(struct platform_device *pdev)
 	u32 dig_cdc_addr;
 	struct msm_dig_priv *msm_dig_cdc;
 	struct dig_ctrl_platform_data *pdata = NULL;
-	bool no_analog_codec = false;
 	int adsp_state = 0;
 
 	adsp_state = apr_get_subsys_state();
@@ -2470,9 +2474,9 @@ static int msm_dig_cdc_probe(struct platform_device *pdev)
 		return -EINVAL;
 
 	if (pdev->dev.of_node)
-		no_analog_codec = of_property_read_bool(pdev->dev.of_node,
+		msm_dig_cdc->no_analog_codec = of_property_read_bool(pdev->dev.of_node,
 					"qcom,no-analog-codec");
-	if (no_analog_codec) {
+	if (msm_dig_cdc->no_analog_codec) {
 		dev_dbg(&pdev->dev, "%s:Platform data from device tree\n",
 				__func__);
 		if (msm_digital_cdc_populate_dt_pdata(&pdev->dev,
@@ -2540,7 +2544,7 @@ static int msm_dig_cdc_probe(struct platform_device *pdev)
 			__func__, dig_cdc_addr);
 	return ret;
 err_supplies:
-	if (no_analog_codec)
+	if (msm_dig_cdc->no_analog_codec)
 		msm_digital_cdc_disable_supplies(msm_dig_cdc);
 rtn:
 	return ret;
